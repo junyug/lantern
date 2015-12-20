@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net"
 	"net/http"
+	_ "net/http/pprof"
 	"os"
 	"os/signal"
 	"runtime"
@@ -51,6 +52,7 @@ var (
 	headless           = flag.Bool("headless", false, "if true, lantern will run with no ui")
 	startup            = flag.Bool("startup", false, "if true, Lantern was automatically run on system startup")
 	clearProxySettings = flag.Bool("clear-proxy-settings", false, "if true, Lantern removes proxy settings from the system.")
+	pprofAddr          = flag.String("pprofaddr", "", "pprof address to listen on, not activate pprof if empty")
 
 	showui = true
 
@@ -83,10 +85,12 @@ func init() {
 	autoupdate.Version = packageVersion
 
 	rand.Seed(time.Now().UnixNano())
+
+	settings.Load(version, revisionDate, buildDate)
 }
 
 func logPanic(msg string) {
-	cfg, err := config.Init(packageVersion)
+	_, err := config.Init(packageVersion)
 	if err != nil {
 		panic("Error initializing config")
 	}
@@ -94,7 +98,7 @@ func logPanic(msg string) {
 		panic("Error initializing logging")
 	}
 
-	<-logging.Configure("", "", cfg.InstanceId, version, revisionDate)
+	<-logging.Configure("", "", settings.GetInstanceID(), version, revisionDate)
 
 	log.Error(msg)
 
@@ -125,6 +129,15 @@ func main() {
 	}
 
 	parseFlags()
+
+	if *pprofAddr != "" {
+		go func() {
+			log.Debugf("Starting pprof page at http://%s/debug/pprof", *pprofAddr)
+			if err := http.ListenAndServe(*pprofAddr, nil); err != nil {
+				log.Error(err)
+			}
+		}()
+	}
 
 	showui = !*headless
 
@@ -161,6 +174,7 @@ func doMain() error {
 		}
 	})
 	addExitFunc(quitSystray)
+	addExitFunc(settings.Save)
 
 	i18nInit()
 	if showui {
@@ -170,8 +184,6 @@ func doMain() error {
 	}
 	displayVersion()
 
-	parseFlags()
-
 	// Run below in separate goroutine as config.Init() can potentially block when Lantern runs
 	// for the first time. User can still quit Lantern through systray menu when it happens.
 	go func() {
@@ -180,6 +192,7 @@ func doMain() error {
 			exit(fmt.Errorf("Unable to initialize configuration: %v", err))
 			return
 		}
+
 		go func() {
 			err := config.Run(func(updated *config.Config) {
 				configUpdates <- updated
@@ -194,20 +207,23 @@ func doMain() error {
 			exit(fmt.Errorf("Wrong arguments"))
 		}
 
-		finishProfiling := profiling.Start(cfg.CpuProfile, cfg.MemProfile)
-		defer finishProfiling()
+		if cfg.CpuProfile != "" || cfg.MemProfile != "" {
+			log.Debugf("Start profiling with cpu file %s and mem file %s", cfg.CpuProfile, cfg.MemProfile)
+			finishProfiling := profiling.Start(cfg.CpuProfile, cfg.MemProfile)
+			addExitFunc(finishProfiling)
+		}
 
 		// Configure stats initially
-		if err := statreporter.Configure(cfg.Stats); err != nil {
+		if err := statreporter.Configure(cfg.Stats, settings.GetInstanceID()); err != nil {
 			exit(err)
 		}
 
 		log.Debug("Running proxy")
 		if cfg.IsDownstream() {
 			// This will open a proxy on the address and port given by -addr
-			go runClientProxy(cfg)
+			runClientProxy(cfg)
 		} else {
-			go runServerProxy(cfg)
+			runServerProxy(cfg)
 		}
 	}()
 
@@ -268,14 +284,15 @@ func runClientProxy(cfg *config.Config) {
 		exit(fmt.Errorf("Unable to resolve UI address: %v", err))
 	}
 
-	settings, err := config.ReadSettings()
+	bootstrap, err := config.ReadBootstrapSettings()
 	var startupUrl string
 	if err != nil {
 		log.Errorf("Could not read settings? %v", err)
 		startupUrl = ""
 	} else {
-		startupUrl = settings.StartupUrl
+		startupUrl = bootstrap.StartupUrl
 	}
+
 	if err = ui.Start(tcpAddr, !showui, startupUrl); err != nil {
 		// This very likely means Lantern is already running on our port. Tell
 		// it to open a browser. This is useful, for example, when the user
@@ -297,7 +314,7 @@ func runClientProxy(cfg *config.Config) {
 	// Only run analytics once on startup. It subscribes to IP discovery
 	// events from geolookup, so it needs to be subscribed here before
 	// the geolookup code executes.
-	analytics.Configure(cfg, version)
+	addExitFunc(analytics.Configure(cfg, version))
 	geolookup.Start()
 
 	// Continually poll for config updates and update client accordingly
@@ -380,14 +397,13 @@ func applyClientConfig(client *client.Client, cfg *config.Config) {
 	}
 
 	autoupdate.Configure(cfg)
-	logging.Configure(cfg.Addr, cfg.CloudConfigCA, cfg.InstanceId,
+	logging.Configure(cfg.Addr, cfg.CloudConfigCA, settings.GetInstanceID(),
 		version, revisionDate)
-	settings.Configure(cfg, version, revisionDate, buildDate)
 	proxiedsites.Configure(cfg.ProxiedSites)
-	log.Debugf("Proxy all traffic or not: %v", cfg.Client.ProxyAll)
-	ServeProxyAllPacFile(cfg.Client.ProxyAll)
+	log.Debugf("Proxy all traffic or not: %v", settings.GetProxyAll())
+	ServeProxyAllPacFile(settings.GetProxyAll())
 	// Note - we deliberately ignore the error from statreporter.Configure here
-	_ = statreporter.Configure(cfg.Stats)
+	_ = statreporter.Configure(cfg.Stats, settings.GetInstanceID())
 
 	// Update client configuration and get the highest QOS dialer available.
 	client.Configure(cfg.Client)
@@ -443,7 +459,7 @@ func runServerProxy(cfg *config.Config) {
 	go func() {
 		for {
 			cfg := <-configUpdates
-			if err := statreporter.Configure(cfg.Stats); err != nil {
+			if err := statreporter.Configure(cfg.Stats, settings.GetInstanceID()); err != nil {
 				log.Debugf("Error configuring statreporter: %v", err)
 			}
 
@@ -458,7 +474,7 @@ func runServerProxy(cfg *config.Config) {
 		if err != nil {
 			log.Errorf("Error while trying to update: %v", err)
 		}
-	})
+	}, settings.GetInstanceID())
 	if err != nil {
 		log.Fatalf("Unable to run server proxy: %s", err)
 	}
